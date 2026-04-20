@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
-"""TARS Event Bus v2.0.0 — Real-time WebSocket event streaming.
+"""TARS Event Bus v3.0.0 — Real-time WebSocket event streaming.
 Connects to HA WebSocket, watches all state changes, routes significant
 events to intelligence layer. Publishes to MQTT. Provides SSE stream.
+
+v3.0 additions:
+  - Bedroom motion state tracking: cache last motion time, expose via /bedroom-motion-age
+  - Sleep disrupting event classification: flag events that would cause audio in bedroom
+  - Rate limit threshold raised to 20 events/min for malfunction flagging
+  - Bedroom/Echo entity constants for cross-addon safety
+  - Silent hours awareness (22:00-08:00)
 
 v2.0 additions:
   - Pattern detection: identify recurring event sequences
@@ -16,6 +23,7 @@ Endpoints:
   GET /patterns — Learned event patterns
   GET /anomalies — Recent anomaly flags
   GET /rate-limits — Current rate limit status
+  GET /bedroom-motion-age — Seconds since last bedroom motion
 """
 import os,json,time,logging,threading,re
 from datetime import datetime,timedelta
@@ -37,6 +45,21 @@ app=Flask(__name__)
 logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
 logger=logging.getLogger('event-bus')
 
+# v3.0: Safety constants
+BEDROOM_ENTITIES = lambda eid: 'bedroom' in eid.lower()
+ECHO_ENTITIES = [
+    'media_player.living_room_echo_show',
+    'media_player.kitchen_echo_show',
+    'media_player.bedroom_echo',
+]
+SILENT_HOURS = lambda: datetime.now().hour >= 22 or datetime.now().hour < 8
+
+# v3.0: Bedroom motion tracking
+last_bedroom_motion_time = None
+
+# v3.0: Sleep-disrupting event classification
+SLEEP_DISRUPTING_DOMAINS = {'media_player', 'tts', 'notify'}
+
 events=deque(maxlen=500)
 counts=Counter()
 states={}
@@ -46,17 +69,17 @@ mqtt=None
 
 # v2.0: Pattern detection
 PATTERN_FILE='/data/patterns.json'
-patterns={}  # {"entity_a->entity_b": {count, last_seen, avg_gap_seconds}}
-recent_sequence=deque(maxlen=20)  # Recent entity changes for sequence detection
+patterns={}
+recent_sequence=deque(maxlen=20)
 
 # v2.0: Anomaly detection
-entity_hour_histogram=defaultdict(lambda: Counter())  # entity_id -> {hour: count}
+entity_hour_histogram=defaultdict(lambda: Counter())
 anomalies=deque(maxlen=100)
 
-# v2.0: Rate limiting
-rate_window=defaultdict(list)  # entity_id -> [timestamps]
+# v2.0: Rate limiting — v3.0: raised threshold to 20
+rate_window=defaultdict(list)
 rate_alerts=deque(maxlen=50)
-RATE_LIMIT=10  # events per minute threshold
+RATE_LIMIT=20  # v3.0: raised from 10 to 20 events/min
 
 def load_patterns():
     global patterns, entity_hour_histogram
@@ -92,9 +115,15 @@ def pub(topic,payload):
         except: pass
 
 def classify_event(ev):
-    """v2.0: Classify event as routine/unusual/critical."""
+    """Classify event as routine/unusual/critical/sleep_disrupting."""
     eid=ev.get('entity_id','')
     hour=datetime.now().hour
+    dom=eid.split('.')[0] if eid else ''
+    
+    # v3.0: Sleep-disrupting classification
+    if SILENT_HOURS() and BEDROOM_ENTITIES(eid):
+        if dom in SLEEP_DISRUPTING_DOMAINS or 'speaker' in eid or 'echo' in eid:
+            return 'sleep_disrupting'
     
     # Critical: presence, lock, security
     if 'presence' in eid or 'lock' in eid:
@@ -103,23 +132,21 @@ def classify_event(ev):
     # Check if this entity normally fires at this hour
     hist=entity_hour_histogram[eid]
     total=sum(hist.values())
-    if total>50:  # Only classify after enough data
+    if total>50:
         hour_pct=hist.get(str(hour),0)/total if total>0 else 0
-        if hour_pct<0.02:  # <2% of events happen at this hour
+        if hour_pct<0.02:
             return 'unusual'
     
     return 'routine'
 
 def detect_anomaly(ev):
-    """v2.0: Flag events at unusual times."""
     eid=ev.get('entity_id','')
     hour=datetime.now().hour
     hist=entity_hour_histogram[eid]
     total=sum(hist.values())
-    
     if total>100:
         hour_pct=hist.get(str(hour),0)/total if total>0 else 0
-        if hour_pct<0.01:  # Very unusual time
+        if hour_pct<0.01:
             anomaly={'entity_id':eid,'hour':hour,'expected_pct':round(hour_pct*100,2),'time':datetime.now().isoformat(),'event':ev}
             anomalies.append(anomaly)
             logger.warning(f'ANOMALY: {eid} at hour {hour} (only {hour_pct*100:.1f}% historical)')
@@ -128,17 +155,12 @@ def detect_anomaly(ev):
     return None
 
 def check_rate_limit(ev):
-    """v2.0: Detect entities firing too rapidly."""
     eid=ev.get('entity_id','')
     now=time.time()
-    
-    # Clean old entries (>60s)
     rate_window[eid]=[t for t in rate_window[eid] if now-t<60]
     rate_window[eid].append(now)
-    
     if len(rate_window[eid])>RATE_LIMIT:
         alert={'entity_id':eid,'events_per_min':len(rate_window[eid]),'time':datetime.now().isoformat(),'message':f'{eid} firing {len(rate_window[eid])} events/min — possible malfunction'}
-        # Only alert once per 5 minutes per entity
         recent_alerts=[a for a in rate_alerts if a['entity_id']==eid and (now-datetime.fromisoformat(a['time']).timestamp())<300]
         if not recent_alerts:
             rate_alerts.append(alert)
@@ -148,62 +170,46 @@ def check_rate_limit(ev):
     return None
 
 def detect_pattern(ev):
-    """v2.0: Track event sequences and identify recurring patterns."""
     eid=ev.get('entity_id','')
     now=time.time()
-    
-    # Add to sequence
     recent_sequence.append({'entity_id':eid,'time':now})
-    
-    # Check for patterns: entity A followed by entity B within 60s
     if len(recent_sequence)>=2:
         prev=recent_sequence[-2]
         gap=now-prev['time']
-        if gap<60 and prev['entity_id']!=eid:  # Different entities within 60s
+        if gap<60 and prev['entity_id']!=eid:
             key=f"{prev['entity_id']}->{eid}"
             if key not in patterns:
                 patterns[key]={'count':0,'last_seen':'','avg_gap':0,'learned':False}
             p=patterns[key]
             p['count']+=1
             p['last_seen']=datetime.now().isoformat()
-            # Running average of gap
             p['avg_gap']=round((p['avg_gap']*(p['count']-1)+gap)/p['count'],1)
-            
-            # Flag as learned routine after 7+ occurrences
             if p['count']>=7 and not p['learned']:
                 p['learned']=True
                 logger.info(f'PATTERN LEARNED: {key} ({p["count"]} times, avg {p["avg_gap"]}s gap)')
                 pub('pattern/learned',{'sequence':key,'count':p['count'],'avg_gap':p['avg_gap']})
-    
-    # Periodic save
     if counts.get('total',0)%100==0:
         save_patterns()
 
 def route(ev):
+    global last_bedroom_motion_time
     eid=ev.get('entity_id','')
     new=ev.get('new_state','')
     old=ev.get('old_state','')
     dom=eid.split('.')[0]
     
-    # v2.0: Classification
+    # v3.0: Track bedroom motion
+    if 'bedroom' in eid and 'motion' in eid and new=='on':
+        last_bedroom_motion_time=time.time()
+        logger.info(f'BEDROOM MOTION: tracked at {datetime.now().isoformat()}')
+    
     ev['classification']=classify_event(ev)
-    
-    # v2.0: Update histogram
     entity_hour_histogram[eid][str(datetime.now().hour)]+=1
-    
-    # v2.0: Anomaly check
     anomaly=detect_anomaly(ev)
-    if anomaly:
-        ev['anomaly']=True
-    
-    # v2.0: Rate limit check
+    if anomaly: ev['anomaly']=True
     rate_alert=check_rate_limit(ev)
-    if rate_alert:
-        ev['rate_limited']=True
-    
-    # v2.0: Pattern detection
+    if rate_alert: ev['rate_limited']=True
     detect_pattern(ev)
-    
     pub(f'state/{dom}/{eid}',{'state':new,'old':old,'classification':ev['classification']})
     
     sig=False
@@ -266,13 +272,12 @@ def ws_thread():
         time.sleep(10)
 
 def pattern_save_loop():
-    """Periodic pattern persistence."""
     while True:
         time.sleep(300)
         save_patterns()
 
 @app.route('/')
-def index(): return jsonify({'name':'TARS Event Bus','version':'2.0.0','connected':ws_ok,'total':counts.get('total',0),'significant':counts.get('significant',0),'patterns_learned':len([p for p in patterns.values() if p.get('learned')])})
+def index(): return jsonify({'name':'TARS Event Bus','version':'3.0.0','connected':ws_ok,'total':counts.get('total',0),'significant':counts.get('significant',0),'patterns_learned':len([p for p in patterns.values() if p.get('learned')])})
 @app.route('/health')
 def health(): return jsonify({'status':'ok' if ws_ok else 'disconnected','websocket':ws_ok,'total':counts.get('total',0),'mqtt':mqtt is not None,'patterns':len(patterns),'anomalies':len(anomalies)})
 @app.route('/events')
@@ -319,8 +324,16 @@ def get_rate_limits():
     active={eid:len([t for t in times if now-t<60]) for eid,times in rate_window.items() if len([t for t in times if now-t<60])>3}
     return jsonify({'active_high_rate':active,'recent_alerts':list(rate_alerts)[-10:]})
 
+# v3.0: Bedroom motion age endpoint
+@app.route('/bedroom-motion-age')
+def bedroom_motion_age():
+    if last_bedroom_motion_time is None:
+        return jsonify({'age_seconds':None,'last_motion':None,'message':'No bedroom motion tracked yet'})
+    age=round(time.time()-last_bedroom_motion_time)
+    return jsonify({'age_seconds':age,'last_motion':datetime.fromtimestamp(last_bedroom_motion_time).isoformat(),'recent':age<1800})
+
 if __name__=='__main__':
-    logger.info(f'TARS Event Bus v2.0.0 on :{API_PORT}')
+    logger.info(f'TARS Event Bus v3.0.0 on :{API_PORT}')
     logger.info(f'WS: {WS_URL}')
     logger.info(f'Domains: {WATCHED}')
     load_patterns()
